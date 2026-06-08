@@ -1,30 +1,68 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/CodingFervor/workflow-engine/internal/cache"
 	"github.com/CodingFervor/workflow-engine/internal/config"
+	"github.com/CodingFervor/workflow-engine/internal/database"
 	"github.com/CodingFervor/workflow-engine/internal/middleware"
+	"github.com/CodingFervor/workflow-engine/internal/service"
 	"github.com/CodingFervor/workflow-engine/pkg/jwt"
+	"github.com/CodingFervor/workflow-engine/pkg/logger"
 )
 
+var svc *service.Context
+
 func main() {
+	// Load config
 	cfg, err := config.Load("configs/config.yaml")
 	if err != nil {
 		log.Fatalf("config load error: %v", err)
 	}
-	jwt.SetSecret(cfg.JWT.Secret)
 
-	r := gin.Default()
+	// Logger
+	logger.SetLevel(cfg.Server.Mode)
+	logger.Info("starting " + "workflow-engine")
+
+	// Database
+	if err := database.Connect(cfg.Database); err != nil {
+		logger.Error("database connect failed", "error", err)
+		log.Fatalf("database: %v", err)
+	}
+	defer database.Close()
+
+	// Redis
+	if err := cache.Connect(cfg.Redis); err != nil {
+		logger.Warn("redis connect failed, running without cache", "error", err)
+	}
+	defer cache.Close()
+
+	// JWT & Service
+	jwt.SetSecret(cfg.JWT.Secret)
+	svc = service.NewContext()
+
+	// Gin
+	if cfg.Server.Mode == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	r := gin.New()
+	r.Use(gin.Recovery())
 	r.Use(middleware.CORS())
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "time": time.Now().Format(time.RFC3339)})
-	})
+	r.Use(requestLogger())
+
+	r.GET("/health", healthCheck)
+	r.GET("/ready", readinessCheck)
 
 	api := r.Group("/api/v1")
 	{
@@ -87,8 +125,59 @@ func main() {
 			auth.GET("/analytics/duration", DurationAnalytics)
 		}
 	}
-	log.Printf("Workflow Engine starting on :%d", cfg.Server.Port)
-	r.Run(":" + strconv.Itoa(cfg.Server.Port))
+
+	// Graceful shutdown
+	addr := ":" + strconv.Itoa(cfg.Server.Port)
+	srv := &http.Server{Addr: addr, Handler: r}
+	go func() {
+		logger.Info("server listening", "port", cfg.Server.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("server error", "error", err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	logger.Info("shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Error("forced shutdown", "error", err)
+	}
+	logger.Info("server exited")
+}
+
+func requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		logger.Info(fmt.Sprintf("%s %s %d", c.Request.Method, c.Request.URL.Path, c.Writer.Status()),
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"latency", time.Since(start).String(),
+			"ip", c.ClientIP(),
+		)
+	}
+}
+
+func healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"time":   time.Now().Format(time.RFC3339),
+	})
+}
+
+func readinessCheck(c *gin.Context) {
+	status := svc.HealthCheck()
+	code := http.StatusOK
+	for _, v := range status {
+		if v != "healthy" {
+			code = http.StatusServiceUnavailable
+			break
+		}
+	}
+	c.JSON(code, gin.H{"checks": status})
 }
 
 func Login(c *gin.Context)   { c.JSON(http.StatusOK, gin.H{"message": "login"}) }
@@ -143,4 +232,3 @@ func Dashboard(c *gin.Context)         { c.JSON(http.StatusOK, gin.H{"data": gin
 func InstanceAnalytics(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"data": []gin.H{}}) }
 func TaskAnalytics(c *gin.Context)     { c.JSON(http.StatusOK, gin.H{"data": []gin.H{}}) }
 func DurationAnalytics(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"data": []gin.H{}}) }
-
